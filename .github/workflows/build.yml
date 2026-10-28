@@ -1,0 +1,165 @@
+
+name: Bouw PTT Direct Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: PTT Direct Android APK 32-bit en 64-bit
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: PTT Direct downloaden
+        uses: actions/checkout@v4
+        with:
+          path: custom-files
+
+      - name: Nederlandse audiopatches downloaden
+        uses: actions/checkout@v4
+        with:
+          repository: michiel66/TS6-Droid-NL
+          ref: main
+          path: dutch-files
+
+      - name: Android basis downloaden
+        uses: actions/checkout@v4
+        with:
+          repository: YUAXI/TS6_Droid_CN
+          ref: 56d3b4d1991a4c565b1f75f419f4563e772f9614
+          path: upstream
+
+      - name: TeamSpeak bibliotheek downloaden
+        uses: actions/checkout@v4
+        with:
+          repository: wslinnn/tslib_multi
+          ref: 8e0bc1150b548f31e0cc859ae8b9d488bd355038
+          path: tslib
+
+      - name: Nederlandse functies en interface toepassen
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p upstream/scripts
+          cp dutch-files/scripts/maak_nederlands.py upstream/scripts/
+          cp dutch-files/scripts/maak_32_64_bit.py upstream/scripts/
+          cp dutch-files/maak_ptt_zijknop.py upstream/scripts/
+          cp dutch-files/maak_rogerpiep.py upstream/scripts/
+          cp dutch-files/maak_audio_pttconnect_3toon.py upstream/scripts/
+          cp dutch-files/maak_volume_media.py upstream/scripts/
+          cp dutch-files/maak_meerdere_favorieten.py upstream/scripts/
+          cp custom-files/ptt_direct_patch.py upstream/scripts/
+          cp custom-files/PttDirectApp.kt upstream/scripts/
+          cp custom-files/assets/ptt_direct_bg.png upstream/scripts/
+          cp custom-files/assets/ptt_direct_icon.png upstream/scripts/
+          cd upstream
+          python3 scripts/maak_nederlands.py
+          python3 scripts/maak_32_64_bit.py
+          python3 scripts/maak_ptt_zijknop.py
+          python3 scripts/maak_rogerpiep.py
+          python3 scripts/maak_audio_pttconnect_3toon.py
+          python3 scripts/maak_volume_media.py
+          python3 scripts/maak_meerdere_favorieten.py
+          python3 scripts/ptt_direct_patch.py
+
+      - name: TeamSpeak patches toepassen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tslib
+          git apply --check ../upstream/patches/tslib_multi-8e0bc11-whisper-groups.patch
+          git apply ../upstream/patches/tslib_multi-8e0bc11-whisper-groups.patch
+          git apply --check ../upstream/patches/tslib_multi-8e0bc11-away-status.patch
+          git apply ../upstream/patches/tslib_multi-8e0bc11-away-status.patch
+
+      - name: Java 17 installeren
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK en NDK installeren
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_MANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -n "$SDK_MANAGER"
+          "$SDK_MANAGER" --sdk_root="$ANDROID_HOME" --install \
+            'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Rust 32-bit installeren
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tslib
+
+      - name: Cargo NDK installeren
+        shell: bash
+        run: cargo install cargo-ndk --locked
+
+      - name: TeamSpeak 32-bit bouwen
+        shell: bash
+        working-directory: tslib
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK="$ANDROID_NDK_HOME"
+          cargo ndk --platform 29 -t armeabi-v7a \
+            -o ../upstream/app/src/main/jniLibs \
+            build --release -p tslib-jni --features vendored-openssl -j2
+
+      - name: Bibliotheken controleren
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s upstream/app/src/main/jniLibs/armeabi-v7a/libtslib_jni.so
+          test -s upstream/app/src/main/jniLibs/arm64-v8a/libtslib_jni.so
+
+      - name: Gradle cache instellen
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Android tests
+        shell: bash
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest -x buildRustLibs
+
+      - name: APK bouwen
+        shell: bash
+        working-directory: upstream
+        run: ./gradlew --no-daemon assembleDebug -x buildRustLibs
+
+      - name: APK en ABI's controleren
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=upstream/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          for abi in armeabi-v7a arm64-v8a; do
+            unzip -Z1 "$APK" | grep -Fx "lib/$abi/libtslib_jni.so"
+          done
+          cp "$APK" PTT-Direct-Android.apk
+          sha256sum PTT-Direct-Android.apk > PTT-Direct-Android.apk.sha256
+
+      - name: APK beschikbaar maken
+        uses: actions/upload-artifact@v4
+        with:
+          name: PTT-Direct-Android-APK
+          path: |
+            PTT-Direct-Android.apk
+            PTT-Direct-Android.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
